@@ -1,0 +1,99 @@
+#!/usr/bin/stap -g
+
+global check_count = 0
+global check_ok
+
+%{
+#include <linux/smp.h>
+#include <linux/percpu.h>
+
+typedef struct {
+    char *name; 
+    unsigned long addr;
+}stap_ksymbol_t;
+
+static int match_ksymbol(void *data, const char *name, 
+                         struct module *module, unsigned long address) {
+    stap_ksymbol_t *ksym = (stap_ksymbol_t *)data;
+    char *target = ksym->name;
+    if (strncmp(target, name, KSYM_NAME_LEN) == 0) {
+        ksym->addr = address;
+        return 1;
+    }
+    return 0;
+}
+/* 
+ *  on CentOS 6.6(2.6.32-504.el6.i686), kallsyms_lookup_name allways return NULL.
+ *  use kallsyms_on_each_symbol which introduced from version 2.6.30
+ */
+static void* search_ksymbol(char *name) {
+    stap_ksymbol_t tmpksym = {.name = name, .addr = 0};
+    if (name == NULL)
+        return 0;
+    kallsyms_on_each_symbol(&match_ksymbol, &tmpksym);
+    return (void*)tmpksym.addr;
+}
+static void *stap_per_cpu__runqueues = NULL;
+
+#ifdef CONFIG_SMP
+#define stap_cpu_rq(cpu) (SHIFT_PERCPU_PTR(stap_per_cpu__runqueues, per_cpu_offset(cpu)))
+#else
+#define stap_cpu_rq(cpu) (stap_per_cpu__runqueues)
+#endif
+%}
+
+function init_per_cpu__runqueues() %{
+    stap_per_cpu__runqueues = search_ksymbol("per_cpu__runqueues");
+    STAP_RETURN((long)stap_per_cpu__runqueues);
+%}
+
+function stap_cpu_rq(cpu) %{
+    int cpu = (int)STAP_ARG_cpu;
+    unsigned long rq = (long)stap_cpu_rq(cpu);
+    STAP_RETURN(rq);
+%}
+
+/*
+ * use this probe to find a kernel function which
+ * has a 'struct rq *' parameter
+ */
+/*
+probe kernel.function("*@kernel/sched.c").return {
+    printf("%s  %s\n", ppfunc(), $$vars)
+    if (++check_count > 512)
+        exit()
+}
+*/
+
+probe begin {
+    if (!init_per_cpu__runqueues()) {
+        printf("Error: init_per_cpu__runqueues fail\n")
+        exit()
+    }
+    printf("checking start...\n")
+    printf("%s\n\n", "cat /proc/kallsyms | grep per_cpu__runqueues")
+    offsetof_lock = &@cast(0, "rq", "kernel")->lock
+    offsetof_curr = &@cast(0, "rq", "kernel")->curr
+    printf("struct rq offsetof   lock=%d  curr=%d\n", offsetof_lock, offsetof_curr)
+}
+
+probe kernel.function("update_cpu_load") {   
+    rqcpu  = @cast($this_rq, "rq", "kernel")->cpu
+    tmp_rq = stap_cpu_rq(rqcpu)
+    if ($this_rq == tmp_rq) {
+        if (!check_ok[rqcpu]) {
+            check_ok[rqcpu] = 1
+            printf("per_cpu__runqueues=%x cpu=%d:this_rq=%x this_rq_cpu=%d stap_cpu_rq=%x succ\n", 
+                   %{(unsigned long)stap_per_cpu__runqueues%}, cpu(), $this_rq, rqcpu, tmp_rq)
+        }
+        if (++check_count > %{num_possible_cpus()%} * 64) {
+            printf("checking pass!\n")
+            exit()
+        }
+    } else {
+        printf("per_cpu__runqueues=%x cpu=%d:this_rq=%x this_rq_cpu=%d stap_cpu_rq=%x fail!\n", 
+               %{(unsigned long)stap_per_cpu__runqueues%}, cpu(), $this_rq, rqcpu, tmp_rq)
+        printf("checking fail!\n")
+        exit()
+    }
+}

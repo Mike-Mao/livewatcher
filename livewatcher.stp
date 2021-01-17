@@ -1,0 +1,697 @@
+#!/usr/bin/stap -g
+
+global hwbp2watcher
+
+%{
+#define STAP_USE_PTRACE_PEEKUSR     1
+#define STAP_USE_DO_TKILL           1
+
+// it seems that calling do_tkill in systemtap probe point causes 
+// the endless loop in kernel.do not call do_tkill when it is 0
+#define STAP_DBG_DO_TKILL           1
+
+#include <linux/sched.h>
+#include <linux/smp.h>
+#include <linux/percpu.h>
+#include <linux/kallsyms.h>
+#include <linux/user.h>
+#include <linux/uaccess.h>
+#include <linux/errno.h>
+#include <linux/signal.h>
+#include <linux/ptrace.h>
+#include <linux/cpumask.h>
+
+#define DR0                    (offsetof(struct user, u_debugreg[0]))
+#define DR1                    (offsetof(struct user, u_debugreg[1]))
+#define DR2                    (offsetof(struct user, u_debugreg[2]))
+#define DR3                    (offsetof(struct user, u_debugreg[3]))
+#define DR6                    (offsetof(struct user, u_debugreg[6]))
+#define DR7                    (offsetof(struct user, u_debugreg[7]))
+#define DR_UMEM_NR             4
+#define LW_RESET_HWBP          0
+
+/* refer to Intel® 64 and IA-32 Architectures Software Developer’s Manual */
+#define DR_HWBP_NR             4
+#define DR6_TRAP_BITS          0xf
+#define DR7_RESERVED_1         (0x700) /*LE(bit8) GE(bit9) bit10*/
+#define DR7LG                  0x1     /*local or global flag. default: local */
+#define SHIFT_LRW(idx,v)       (((v)&0xf)<<(16 + ((idx)<<2)))
+#define SHIFT_LG(idx,v)        (((v)&0x3)<<((idx)<<1))
+#define DR7MASK(idx)           (SHIFT_LRW(idx, 0xf) | SHIFT_LG(idx, 0x3))
+#define DR7VALUE(idx, len, rw) (SHIFT_LRW(idx, ((len)<<2) | (rw)) | SHIFT_LG(idx, DR7LG))
+#define clr_dr7(old, idx)      (old & (~DR7MASK(idx)))
+#define set_dr7(old, idx, len, rw) (clr_dr7(old, idx) | DR7VALUE(idx, len, rw) | DR7_RESERVED_1)
+#define eq_dr7 (old, idx, len, rw) ((old & DR7MASK(idx)) == DR7VALUE(idx, len, rw))
+
+/* refer to the user space encoding format */
+#define DECODE_FD(idx, len, rw, fd)  do {                     \
+                                        idx = (fd >> 8) & 0xf;\
+                                        len = (fd >> 4) & 0xf;\
+                                        rw  = fd        & 0xf;\
+                                     } while(0)
+
+enum LW_IOCTL_OPS {
+    LW_IOCTL_MIN = 0x7fffff00,  //MUST be the first one
+    LW_IOCTL_SET_HWBP,
+    LW_IOCTL_SYNC_HWBP,
+    LW_IOCTL_ATINIT,
+    LW_IOCTL_ATEXIT,
+    LW_IOCTL_DUMP_DR,
+    LW_IOCTL_SHOW_INFO,
+    LW_IOCTL_IGNORE_HWBP_SIGTRAP,
+    LW_IOCTL_RECORD_WATCHER,
+    LW_IOCTL_UBACKTRACE_DETAIL,
+    LW_IOCTL_TKILL_WEIGHT,
+    LW_IOCTL_MAX                //MUST be the last one
+};
+struct dr7_t {
+    unsigned int  dr0_local:      1;
+    unsigned int  dr0_global:     1;
+    unsigned int  dr1_local:      1;
+    unsigned int  dr1_global:     1;
+    unsigned int  dr2_local:      1;
+    unsigned int  dr2_global:     1;
+    unsigned int  dr3_local:      1;
+    unsigned int  dr3_global:     1;
+    unsigned int  le:             1;
+    unsigned int  ge:             1;
+    unsigned int  reserved_10:    1;
+    unsigned int  rtm:            1;
+    unsigned int  reserved_12:    1;
+    unsigned int  gd:             1;
+    unsigned int  reserved_14_15: 2;
+    unsigned int  dr0_rw:         2;
+    unsigned int  dr0_len:        2;
+    unsigned int  dr1_rw:         2;
+    unsigned int  dr1_len:        2;
+    unsigned int  dr2_rw:         2;
+    unsigned int  dr2_len:        2;
+    unsigned int  dr3_rw:         2;
+    unsigned int  dr3_len:        2;
+};
+
+typedef struct {
+    char *name; 
+    unsigned long addr;
+}stap_ksymbol_t;
+
+typedef struct  {
+    int  pid; 
+    long __user *umem;
+}stap_dr_umem_t;
+
+#if defined(STAP_USE_DO_TKILL) && STAP_USE_DO_TKILL
+#if STAP_USE_DO_TKILL == 2
+/*
+ *  'struct rq' is not exported and it is a incomplete type
+ *  in this program.But we can get the runqueue pointer of
+ *  each CPU and then we need to confirm the offset of lock 
+ *  and curr:1)lock is the first member up to 5.7.0   2)the 
+ *  position of the curr is based on onditional compilation
+ *  and kernel version.we use &@cast to get the offset value.
+ */
+static void *stap_per_cpu__runqueues = NULL;
+static int  stap_rq_offsetof_lock    = -1;
+static int  stap_rq_offsetof_curr    = -1;
+#endif
+int(*stap_do_tkill)(pid_t tgid, pid_t pid, int sig) = NULL;
+#endif
+
+long (*stap_arch_ptrace)(struct task_struct *child,long request, 
+                         long addr, long data) = NULL;
+
+static DEFINE_SEQLOCK(stap_hwbp_lock);
+static int            stap_hwbp_pid = -1;
+static unsigned long  stap_hwbp[DR_HWBP_NR+1] = {0,0,0,0,0};
+
+static DEFINE_RWLOCK (stap_dr_umem_lock);
+static long __user   *stap_dr_umem = NULL;
+static stap_dr_umem_t stap_dr_umems[DR_UMEM_NR] = {};
+
+/* these configurations could be accessed without lock */
+int ubacktrace_detail   = 1;
+int ignore_hwbp_sigtrap = 1;
+int record_watcher      = 0;
+unsigned tkill_weight   = 1;
+
+/**********************************************************/
+static int match_ksymbol(void *data, const char *name, 
+                         struct module *module, unsigned long address) {
+    stap_ksymbol_t *ksym = (stap_ksymbol_t *)data;
+    char *target = ksym->name;
+    if (strncmp(target, name, KSYM_NAME_LEN) == 0) {
+        ksym->addr = address;
+        return 1;
+    }
+    return 0;
+}
+/*
+ *  on CentOS 6.6(2.6.32-504.el6.i686), kallsyms_lookup_name allways return NULL.
+ *  use kallsyms_on_each_symbol which introduced from version 2.6.30
+ */
+static void* search_ksymbol(char *name) {
+    stap_ksymbol_t tmpksym = {.name = name, .addr = 0};
+    if (name == NULL)
+        return 0;
+    kallsyms_on_each_symbol(&match_ksymbol, &tmpksym);
+    return (void*)tmpksym.addr;
+}
+
+#if defined(STAP_USE_DO_TKILL) && STAP_USE_DO_TKILL == 2
+#ifdef CONFIG_SMP
+#define stap_cpu_rq(cpu) (SHIFT_PERCPU_PTR(stap_per_cpu__runqueues, per_cpu_offset(cpu)))
+#else
+#define stap_cpu_rq(cpu) (stap_per_cpu__runqueues)
+#endif
+#define stap_task_rq(p)  stap_cpu_rq(task_cpu(p))
+
+#define stap_rq_curr_ptr(rq) ((struct task_struct*)((void*)rq + stap_rq_offsetof_curr))
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,33)
+#define stap_rq_lock_ptr(rq) (raw_spinlock_t*)((void*)rq + stap_rq_offsetof_lock)
+#define stap_lock_rq(rq)      raw_spin_lock(stap_rq_lock_ptr(rq))
+#define stap_unlock_rq(rq)    raw_spin_unlock(stap_rq_lock_ptr(rq))
+#else
+#define stap_rq_lock_ptr(rq) (spinlock_t*)((void*)rq + stap_rq_offsetof_lock)
+#define stap_lock_rq(rq)      spin_lock(stap_rq_lock_ptr(rq))
+#define stap_unlock_rq(rq)    spin_unlock(stap_rq_lock_ptr(rq))
+#endif
+
+static inline int stap_task_running(struct task_struct *p)
+{
+#ifdef CONFIG_SMP
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,0,0)
+	return p->on_cpu;
+#elif defined(__ARCH_WANT_UNLOCKED_CTXSW)
+    return p->oncpu;
+#else
+    void *rq = stap_task_rq(p);
+	return stap_rq_curr_ptr(rq) == p;
+#endif
+#else
+    void *rq = stap_task_rq(p);
+	return stap_rq_curr_ptr(rq) == p;
+#endif
+}
+static inline void * stap_lock_taskrq(struct task_struct *p) {   
+    void *rq;
+    if (stap_task_running(p) 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,18,0)
+        || task_on_rq_migrating(p)
+#endif
+       ) {
+        return NULL;
+    }
+    rq = stap_task_rq(p);
+	stap_lock_rq(rq);	
+    if (likely(rq == stap_task_rq(p) 
+        && !stap_task_running(p)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,18,0)
+        && !task_on_rq_migrating(p)
+#endif
+        )) {
+        return rq;
+    }
+    stap_unlock_rq(rq);
+    return NULL;
+}
+static inline void stap_unlock_taskrq(void *rq) {
+    if (rq)
+        stap_unlock_rq(rq);
+}
+#endif
+
+static long __getdr(struct task_struct *tsk, int dr) {
+    int error;
+    long value = -1;
+#if defined(STAP_USE_PTRACE_PEEKUSR) && STAP_USE_PTRACE_PEEKUSR
+    read_lock(&stap_dr_umem_lock);
+    if (stap_dr_umem != NULL) {
+        long __user* datap = stap_dr_umem + smp_processor_id();
+        do {
+            error = stap_arch_ptrace(tsk, PTRACE_PEEKUSR, dr, (long)datap);
+            if (error) {
+                printk("livewatcher error:arch_ptrace errno=%d\n", error);
+                value = error;
+                break;
+            }
+            error = get_user(value, datap);
+            if (error) {
+                printk("livewatcher error:get_user errno=%d\n", error);
+                value = error;
+                break;
+            }
+        } while(0);
+    } else {
+        printk("livewatcher error:no userspace memory\n");
+        value = -ENOMEM;
+    }
+    read_unlock(&stap_dr_umem_lock);
+#else
+    struct thread_struct *thread = &(tsk->thread);
+    switch(dr)
+    {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,33)
+        case DR0:
+        case DR1:
+        case DR2:
+        case DR3:
+                {
+                    struct perf_event *bp;
+                    bp = thread->ptrace_bps[(dr - DR0) / sizeof(long)];
+                    value =  bp ? bp->hw.info.address : 0;
+                }
+                break;
+        case DR6: value = thread->debugreg6; break;
+        case DR7: value = thread->ptrace_dr7;break;
+        default:  value = -1;                break;
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,25)
+        case DR0: value = thread->debugreg0; break;
+        case DR1: value = thread->debugreg1; break;
+        case DR2: value = thread->debugreg2; break;
+        case DR3: value = thread->debugreg3; break;
+        case DR6: value = thread->debugreg6; break;
+        case DR7: value = thread->debugreg7; break;
+        default:  value = -1;                break;
+#else
+#error "Not Support Debug Register"
+#endif
+    }
+#endif
+    return value;
+}
+/*
+ *  In 64-bit mode, the upper 32 bits of DR6 and DR7 are reserved 
+ *  and must be written with zeros
+ */
+static long __setdr(struct task_struct *tsk, int dr, long value) {
+    if (dr == DR6 || dr == DR7)
+        value &= 0xffffffff;
+    return stap_arch_ptrace(tsk, PTRACE_POKEUSR, dr, value);
+}
+void __sync_hwbp(struct task_struct *tsk, int dr) {
+#define SYNC_ONE(dr,idx) do {                                  \
+                            if(__getdr(tsk,dr)!=stap_hwbp[idx])\
+                               __setdr(tsk,dr,stap_hwbp[idx]); \
+                         } while(0)
+    unsigned int seq;
+    do {
+		seq = read_seqbegin(&stap_hwbp_lock);
+        switch(dr) {
+            case DR0:SYNC_ONE(DR0, 0);break;
+            case DR1:SYNC_ONE(DR1, 1);break;
+            case DR2:SYNC_ONE(DR2, 2);break;
+            case DR3:SYNC_ONE(DR3, 3);break;
+            default:
+                 SYNC_ONE(DR0, 0);
+                 SYNC_ONE(DR1, 1);
+                 SYNC_ONE(DR2, 2);
+                 SYNC_ONE(DR3, 3);
+        }
+        SYNC_ONE(DR7, DR_HWBP_NR);
+	} while (read_seqretry(&stap_hwbp_lock, seq));
+#undef SYNC_ONE
+}
+%}
+/**********************************************************/
+function STAP_USE_PTRACE_PEEKUSR() %{
+#ifdef STAP_USE_PTRACE_PEEKUSR
+    STAP_RETURN(STAP_USE_PTRACE_PEEKUSR);
+#else
+    STAP_RETURN(0);
+#endif
+%}
+function STAP_USE_DO_TKILL() %{
+#ifdef STAP_USE_DO_TKILL
+    STAP_RETURN(STAP_USE_DO_TKILL);
+#else
+    STAP_RETURN(0);
+#endif
+%}
+/*
+ * in stp,long is 64bit,we get a big positive number if a negative number
+ * is passed in unsigned type and use this function to convert long type
+ */
+ /*
+function convert_long:long(arg:long) %{
+    long ret = (long)STAP_ARG_arg;
+    STAP_RETURN(ret);
+%}
+*/
+function __init_stap_runtime(lock, curr) %{
+    long ret = 0;
+    stap_arch_ptrace = search_ksymbol("arch_ptrace");
+    ret = (long)stap_arch_ptrace;
+#if defined(STAP_USE_DO_TKILL) && STAP_USE_DO_TKILL
+    stap_do_tkill = search_ksymbol("do_tkill");
+    ret = ret && (long)stap_do_tkill;
+#if STAP_USE_DO_TKILL == 2
+    stap_per_cpu__runqueues = search_ksymbol("per_cpu__runqueues");
+    stap_rq_offsetof_lock   = STAP_ARG_lock;
+    stap_rq_offsetof_curr   = STAP_ARG_curr;
+    ret = ret && (long)stap_per_cpu__runqueues;
+    ret = ret && (stap_rq_offsetof_lock >= 0);
+    ret = ret && (stap_rq_offsetof_curr >= 0);
+#endif
+#endif
+    STAP_RETURN(ret);
+%}
+function init_stap_runtime() {
+    lock = &@cast(0, "rq", "kernel")->lock
+    curr = &@cast(0, "rq", "kernel")->curr
+    return __init_stap_runtime(lock, curr)
+}
+function getdr:long(task:long, reg:long) %{
+    struct task_struct *tsk = (struct task_struct *)(long)STAP_ARG_task;
+    long ret = __getdr(tsk, STAP_ARG_reg);
+    STAP_RETURN(ret);
+%}
+function setdr:long(task:long, reg:long, value:long) %{
+    struct task_struct *tsk = (struct task_struct *)(long)STAP_ARG_task;
+    long ret = __setdr(tsk, STAP_ARG_reg, STAP_ARG_value);
+    STAP_RETURN(ret);
+%}
+function dump_dr(resetdr6) {
+    tsk = task_current()
+    v1 = getdr(tsk, %{DR0%})
+    v2 = getdr(tsk, %{DR1%})
+    printf("DR0=0x%-16x    DR1=0x%-16x\n", v1, v2)
+    v1 = getdr(tsk, %{DR2%})
+    v2 = getdr(tsk, %{DR3%})
+    printf("DR2=0x%-16x    DR3=0x%-16x\n", v1, v2)
+    v1 = getdr(tsk, %{DR6%}) & 0xffffffff
+    v2 = getdr(tsk, %{DR7%}) & 0xffffffff
+    printf("DR6=0x%-16x    DR7=0x%-16x\n", v1, v2)
+    if (resetdr6 && v1 != -1 && 
+        setdr(tsk, %{DR6%}, v1 & (~0x400f))) {
+        printf("Error: fail to write DR6\n")
+    }
+}
+function sync_hwbp(task:long) %{
+#if defined(STAP_USE_DO_TKILL) && STAP_USE_DO_TKILL
+    struct task_struct *tsk = (struct task_struct *)(long)STAP_ARG_task;
+    __sync_hwbp(tsk, -1);
+#endif
+%}
+function reset_hwbp(pid:long) %{
+    write_seqlock(&stap_hwbp_lock);
+    stap_hwbp_pid = STAP_ARG_pid;
+    memset(stap_hwbp, 0, sizeof(stap_hwbp));
+    write_sequnlock(&stap_hwbp_lock);
+%}
+function show_taskinfo() {
+    printf("%s(%d)\n", tz_ctime(gettimeofday_s()), gettimeofday_us())
+    printf("exe=%s  pid=%d  tid=%d  cpu=%d\n", 
+            execname(), pid(), tid(), cpu())
+}
+function set_ignore_hwbp_sigtrap(arg) %{
+    ignore_hwbp_sigtrap = !!STAP_ARG_arg;
+%}
+function set_record_watcher(arg) %{
+    long tmp = (long)STAP_ARG_arg;
+    if (tmp == 1 || tmp == 2) {tmp = 3;}
+    record_watcher = tmp;
+%}
+function set_ubacktrace_detail(arg) %{
+    ubacktrace_detail = !!STAP_ARG_arg;
+%}
+function set_tkill_weight(arg) %{
+    tkill_weight = STAP_ARG_arg > 0 ? STAP_ARG_arg : -1;
+%}
+function setwatcher:long(task:long, para:long, addr:long) %{  /* guru */
+    static const long hwbpmap[DR_HWBP_NR] = {DR0, DR1, DR2, DR3};
+    long newaddr = STAP_ARG_addr == LW_RESET_HWBP ? 0 : STAP_ARG_addr;
+    struct task_struct *tsk = (struct task_struct *)(long)STAP_ARG_task;
+    struct task_struct *t   = tsk;
+    unsigned int idx, len, rw, skip;
+    unsigned int mask,new,cpu;
+
+    DECODE_FD(idx, len, rw, STAP_ARG_para);
+    if(len >= 4 || idx >= DR_HWBP_NR || 
+       (rw != 0 && rw != 1 && rw != 3)) {
+        printk("livewatcher error:invalid parameters\n");
+        STAP_RETURN(-EINVAL);
+    }
+
+    skip = 1;
+    mask = DR7MASK(idx);
+    new  = DR7VALUE(idx, len, rw);
+    write_seqlock(&stap_hwbp_lock);
+    if (stap_hwbp_pid != tsk->tgid) {
+        write_sequnlock(&stap_hwbp_lock);
+        printk("livewatcher error:%d is running,%d needs to wait\n", 
+               stap_hwbp_pid, tsk->tgid);
+        STAP_RETURN(-EBUSY);
+    } else if (stap_hwbp[idx] != newaddr ||
+        (stap_hwbp[DR_HWBP_NR] & mask) != new) {
+        skip = 0;
+        stap_hwbp[idx] = newaddr;
+        stap_hwbp[DR_HWBP_NR] &= (~mask);
+        if (newaddr)
+            stap_hwbp[DR_HWBP_NR] |= new;
+        if (stap_hwbp[DR_HWBP_NR] & 0xff)
+            stap_hwbp[DR_HWBP_NR] |= DR7_RESERVED_1;
+        else
+            stap_hwbp[DR_HWBP_NR] = 0;
+    }
+    write_sequnlock(&stap_hwbp_lock);
+    if (skip) {
+        goto end;
+    }
+
+#if defined(STAP_USE_DO_TKILL) && STAP_USE_DO_TKILL
+    __sync_hwbp(tsk, hwbpmap[idx]);
+    cpu = smp_processor_id();
+ 
+    while_each_thread(tsk, t) {
+        if (task_cpu(t) == cpu) {
+            __sync_hwbp(t, hwbpmap[idx]);
+        } else {
+#if STAP_USE_DO_TKILL == 2
+            void *rq = stap_lock_taskrq(t);
+            if (rq && ++skip % tkill_weight == 0) {
+                __sync_hwbp(t, hwbpmap[idx]);
+                stap_unlock_taskrq(rq);
+            } else {
+                stap_unlock_taskrq(rq);
+#if STAP_DBG_DO_TKILL
+                stap_do_tkill(t->tgid, t->pid, SIGUSR1);
+#endif
+            }
+#else
+#if STAP_DBG_DO_TKILL
+            stap_do_tkill(t->tgid, t->pid, SIGUSR1);
+#endif
+#endif
+        }
+    }
+#else
+    do {
+        if (t->exit_state == 0) {
+            __sync_hwbp(tsk, hwbpmap[idx]);
+        }
+    } while_each_thread(tsk, t);
+#endif
+end:
+    STAP_RETURN(0);
+%}
+function __set_dr_umem(daemon, pid, umem) %{  
+    long ret = -1, i;
+    long valid = -1, free = -1, found = -1;
+    const long daemon = STAP_ARG_daemon;
+    long pid = STAP_ARG_pid;
+    unsigned long *umem = (unsigned long*)(long)STAP_ARG_umem;
+    
+    if (pid == 0)
+        STAP_RETURN(-1);
+ 
+    write_lock(&stap_dr_umem_lock);
+    if (umem) {
+        stap_dr_umem = NULL;
+        memset(stap_dr_umems, 0, sizeof(stap_dr_umems));
+    }
+    for(i = 0; i < DR_UMEM_NR; ++i) {
+        if (stap_dr_umems[i].pid == 0) {
+            if (free == -1) free = i;
+        } else if (stap_dr_umems[i].pid != pid) {
+            if (valid == -1) valid = i;
+        } else if (found == -1) {
+            found = i;
+        } else {
+            goto end;
+        }
+    }
+    if (umem == 0) {
+        ret = 0;
+        if (found >= 0) {
+            if (stap_dr_umems[found].umem == stap_dr_umem) {
+                stap_dr_umem = valid >= 0 ? 
+                    stap_dr_umems[valid].umem : NULL;
+            }
+            stap_dr_umems[found].pid  = 0;
+            stap_dr_umems[found].umem = 0;
+        }
+    } else if (access_ok(VERIFY_WRITE, umem, 
+               sizeof(long) * num_possible_cpus() == 0)) {
+        if (found >= 0) {
+            if (stap_dr_umem == stap_dr_umems[found].umem)
+                stap_dr_umem = umem;
+            stap_dr_umems[found].umem = umem;
+            ret = 0;
+        } else if (free >= 0) {
+            stap_dr_umems[free].pid  = pid;
+            stap_dr_umems[free].umem = umem;
+            if (stap_dr_umem == NULL) {
+                stap_dr_umem = umem;
+            }
+            ret = 0;
+        }
+    }
+end:
+    write_unlock(&stap_dr_umem_lock);
+    STAP_RETURN(ret);
+%}
+function set_dr_umem(exe, pid, umem) {
+    if (!STAP_USE_PTRACE_PEEKUSR()) {
+        if (umem) printf("Error:do not support PTRACE_PEEKUSR")
+        return umem ? %{-EPERM%} : 0
+    }
+    return __set_dr_umem(0, pid, umem)
+}
+/**********************************************************/
+//probe scheduler.process_exit {
+//    if (pid() == tid()) {
+//    }
+//}
+
+probe syscall.ptrace {
+    printf("Warning:ptrace  %s pid=%d req=%x addr=%x data=%x\n", 
+           execname(), $pid, $request, $addr, $data)
+}
+probe procfs("lw_ignore_hwbp_sigtrap").write {
+    set_ignore_hwbp_sigtrap(strtol($value, 10))
+}
+probe procfs("lw_ignore_hwbp_sigtrap").read {
+    $value = sprintf("%d\n", %{ignore_hwbp_sigtrap%} ? 1 : 0)
+}
+probe procfs("lw_record_watcher").write {
+    set_record_watcher(strtol($value, 10))
+}
+probe procfs("lw_record_watcher").read {
+    $value = sprintf("%d\n", %{record_watcher%})
+}
+probe procfs("lw_ubacktrace_detail").write {
+    set_ubacktrace_detail(strtol($value, 10))
+}
+probe procfs("lw_ubacktrace_detail").read {
+    $value = sprintf("%d\n", %{ubacktrace_detail%} ? 1 : 0)
+}
+probe procfs("lw_tkill_weight").write {
+    set_tkill_weight(strtol($value, 10))
+}
+probe procfs("lw_tkill_weight").read {
+    $value = sprintf("%d\n", %{tkill_weight%})
+}
+probe procfs("lw_runtime").read {
+    v00 = %{stap_dr_umems[0].pid%}
+    v01 = %{(unsigned long)stap_dr_umems[0].umem%}
+    v10 = %{stap_dr_umems[1].pid%}
+    v11 = %{(unsigned long)stap_dr_umems[1].umem%}
+    v20 = %{stap_dr_umems[2].pid%}
+    v21 = %{(unsigned long)stap_dr_umems[2].umem%}
+    v30 = %{stap_dr_umems[3].pid%}
+    v31 = %{(unsigned long)stap_dr_umems[3].umem%}
+    cnt = %{DR_UMEM_NR%}
+    cur = %{(unsigned long)stap_dr_umem%}
+    
+    s1 = sprintf("STAP_USE_PTRACE_PEEKUSR=%d\n", STAP_USE_PTRACE_PEEKUSR())
+    s2 = sprintf("STAP_USE_DO_TKILL=%d\n\n", STAP_USE_DO_TKILL())
+    s3 = sprintf("pid=%d\nDR0=%x\nDR1=%x\nDR2=%x\nDR3=%x\nDR7=%x\n\n", 
+         %{stap_hwbp_pid%}, %{stap_hwbp[0]%}, %{stap_hwbp[1]%}, 
+         %{stap_hwbp[2]%},  %{stap_hwbp[3]%}, %{stap_hwbp[4]%})
+    s4 = sprintf("userspace memory:\ntotal  count=%d\nactive umem=0x%x\n",cnt,cur)
+    s5 = sprintf("pid=%d  addr=0x%x\npid=%d  addr=0x%x\n",v00,v01,v10,v11)
+    s6 = sprintf("pid=%d  addr=0x%x\npid=%d  addr=0x%x\n",v20,v21,v30,v31)
+    
+    $value = sprintf("%s%s%s%s%s%s", s1,s2,s3,s4,s5,s6)
+}
+probe kernel.function("prepare_signal").return {
+	if ($sig == %{SIGTRAP%}) {
+        hwbp = getdr(task_current(), %{DR6%}) & %{DR6_TRAP_BITS%}
+        if (hwbp > 0) {
+            show_taskinfo()
+            dump_dr(1)
+            if (%{record_watcher%}) {
+                printf("watchpoint:\n")
+                print_usyms(hwbp2watcher[hwbp])
+                printf("breakpoint:\n")
+            }
+            if (%{ubacktrace_detail%} == 1) {
+                print_ubacktrace()
+            } else {
+                print_ubacktrace_brief()
+            }
+            printf("\n\n")
+            if (%{ignore_hwbp_sigtrap%}) {
+                $return = 0  
+            }
+        }
+	}
+}
+probe syscall.ioctl {
+    if ($cmd == %{LW_IOCTL_SYNC_HWBP%}) {
+        sync_hwbp(task_current())
+    }
+}
+probe syscall.ioctl.return {
+    if ($return != 0 && 
+        $cmd >= %{LW_IOCTL_MIN%} && 
+        $cmd <= %{LW_IOCTL_MAX%}) {
+        ret = 0
+        if ($cmd == %{LW_IOCTL_SET_HWBP%}) {
+           ret = setwatcher(task_current(), $fd, $arg)
+           if (%{record_watcher%} && ret == 0) {
+               hwbp = 1 << (($fd >> 8) & 0xf)
+               hwbp2watcher[hwbp] = %{record_watcher%} < 0 ?
+                   ubacktrace():ucallers(%{record_watcher%})
+           }
+        } else if ($cmd == %{LW_IOCTL_SYNC_HWBP%}) {
+            ret = 0
+        } else if ($cmd == %{LW_IOCTL_ATINIT%}) {
+            reset_hwbp(pid())
+            ret = set_dr_umem(execname(), pid(), $arg)
+        } else if ($cmd == %{LW_IOCTL_ATEXIT%}) {
+            reset_hwbp(-1);
+            ret = set_dr_umem(execname(), pid(), 0)
+        } else if ($cmd == %{LW_IOCTL_DUMP_DR%}) {
+            show_taskinfo()
+            dump_dr(0)
+        } else if ($cmd == %{LW_IOCTL_SHOW_INFO%}) {
+            printf("%s", user_string($arg))
+        } else if ($cmd == %{LW_IOCTL_IGNORE_HWBP_SIGTRAP%}) {
+            set_ignore_hwbp_sigtrap($arg)
+        } else if ($cmd == %{LW_IOCTL_RECORD_WATCHER%}) {
+            set_record_watcher($arg)
+        } else if ($cmd == %{LW_IOCTL_UBACKTRACE_DETAIL%}) {
+            set_ubacktrace_detail($arg)
+        } else if ($cmd == %{LW_IOCTL_TKILL_WEIGHT%}) {
+            set_tkill_weight($arg)
+        } else {
+            ret = %{-EINVAL%}
+        }
+        $return = ret
+    }
+}
+probe begin {
+    %( arch != "i386" && arch != "i686" && arch != "x86 64" %?
+        printf("Error: do not support this architecture\n")
+        exit()
+    %)
+    if (!init_stap_runtime()) {
+        printf("Error: init_stap_runtime fail\n")
+        exit()
+    }
+    printf("livewatcher start...\n")
+}
+probe end {
+    printf("livewatcher exit!\n")
+}
