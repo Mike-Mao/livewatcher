@@ -84,9 +84,9 @@ void* test_thread3(void* args) {
     (void)args;
     printf("test_thread3  PID: %d TID: %lu, CPU: %d\n", getpid(), gettid(), sched_getcpu());
     usleep(10000);
-    test1 = 9999;
-    test2 = 9999;
     test3 = 9999;
+    test2 = 9999;
+    test1 = 9999;
     test4 = 9999;
     return 0;
 }

@@ -4,11 +4,7 @@ global hwbp2watcher
 
 %{
 #define STAP_USE_PTRACE_PEEKUSR     1
-#define STAP_USE_DO_TKILL           1
-
-// it seems that calling do_tkill in systemtap probe point causes 
-// the endless loop in kernel.do not call do_tkill when it is 0
-#define STAP_DBG_DO_TKILL           1
+#define STAP_USE_DO_TKILL           2
 
 #include <linux/sched.h>
 #include <linux/smp.h>
@@ -61,7 +57,6 @@ enum LW_IOCTL_OPS {
     LW_IOCTL_IGNORE_HWBP_SIGTRAP,
     LW_IOCTL_RECORD_WATCHER,
     LW_IOCTL_UBACKTRACE_DETAIL,
-    LW_IOCTL_TKILL_WEIGHT,
     LW_IOCTL_MAX                //MUST be the last one
 };
 struct dr7_t {
@@ -132,7 +127,6 @@ static stap_dr_umem_t stap_dr_umems[DR_UMEM_NR] = {};
 int ubacktrace_detail   = 1;
 int ignore_hwbp_sigtrap = 1;
 int record_watcher      = 0;
-unsigned tkill_weight   = 1;
 
 /**********************************************************/
 static int match_ksymbol(void *data, const char *name, 
@@ -414,9 +408,7 @@ function set_record_watcher(arg) %{
 function set_ubacktrace_detail(arg) %{
     ubacktrace_detail = !!STAP_ARG_arg;
 %}
-function set_tkill_weight(arg) %{
-    tkill_weight = STAP_ARG_arg > 0 ? STAP_ARG_arg : -1;
-%}
+
 function setwatcher:long(task:long, para:long, addr:long) %{  /* guru */
     static const long hwbpmap[DR_HWBP_NR] = {DR0, DR1, DR2, DR3};
     long newaddr = STAP_ARG_addr == LW_RESET_HWBP ? 0 : STAP_ARG_addr;
@@ -468,19 +460,15 @@ function setwatcher:long(task:long, para:long, addr:long) %{  /* guru */
         } else {
 #if STAP_USE_DO_TKILL == 2
             void *rq = stap_lock_taskrq(t);
-            if (rq && ++skip % tkill_weight == 0) {
+            if (rq) {
                 __sync_hwbp(t, hwbpmap[idx]);
                 stap_unlock_taskrq(rq);
             } else {
                 stap_unlock_taskrq(rq);
-#if STAP_DBG_DO_TKILL
                 stap_do_tkill(t->tgid, t->pid, SIGUSR1);
-#endif
             }
 #else
-#if STAP_DBG_DO_TKILL
             stap_do_tkill(t->tgid, t->pid, SIGUSR1);
-#endif
 #endif
         }
     }
@@ -585,12 +573,7 @@ probe procfs("lw_ubacktrace_detail").write {
 probe procfs("lw_ubacktrace_detail").read {
     $value = sprintf("%d\n", %{ubacktrace_detail%} ? 1 : 0)
 }
-probe procfs("lw_tkill_weight").write {
-    set_tkill_weight(strtol($value, 10))
-}
-probe procfs("lw_tkill_weight").read {
-    $value = sprintf("%d\n", %{tkill_weight%})
-}
+
 probe procfs("lw_runtime").read {
     v00 = %{stap_dr_umems[0].pid%}
     v01 = %{(unsigned long)stap_dr_umems[0].umem%}
@@ -673,8 +656,6 @@ probe syscall.ioctl.return {
             set_record_watcher($arg)
         } else if ($cmd == %{LW_IOCTL_UBACKTRACE_DETAIL%}) {
             set_ubacktrace_detail($arg)
-        } else if ($cmd == %{LW_IOCTL_TKILL_WEIGHT%}) {
-            set_tkill_weight($arg)
         } else {
             ret = %{-EINVAL%}
         }

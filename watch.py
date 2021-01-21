@@ -6,6 +6,14 @@ import fcntl,select,argparse
 from subprocess import Popen, PIPE
 from abc import ABCMeta, abstractmethod
 
+def execute(cmd):
+    process = Popen(cmd, shell=True, stdout=PIPE, close_fds=True)
+    output = process.communicate()[0]
+    process.stdout.close()
+    if process.poll() != 0:
+        return ''
+    return output.strip()
+
 class logger():
     logfile = None
     @staticmethod
@@ -38,6 +46,7 @@ class logger():
         logger.log(msg)
         logger.logfile.close()
         exit(-1)
+
 class cmdargs():
     def __init__(self, arg):
         if not arg.p:
@@ -52,9 +61,9 @@ class cmdargs():
             return ''
         if os.getcwd() not in os.environ['PATH']:
             os.putenv('PATH','%s:%s'%(os.environ['PATH'], os.getcwd()))
-        return os.popen('which %s 2>/dev/null'%process).read().strip()
+        return execute('which %s 2>/dev/null'%process)
     def cmdline(self, pid):
-        path = os.popen('strings /proc/%s/cmdline | head -1'%pid).read()
+        path = execute('strings /proc/%s/cmdline | head -1'%pid)
         if '/' not in path:
             path = self.which(path)
         return path.strip()
@@ -64,7 +73,7 @@ class cmdargs():
         elif exe[0] in '/.':
             path = os.path.abspath(exe)
         else:
-            info = os.popen('pidof %s'%exe).read()
+            info = execute('pidof %s'%exe)
             if len(info) > 0:
                 exepaths = set(map(self.cmdline, info.split()))
                 if len(exepaths) > 1:
@@ -113,6 +122,8 @@ class stap_ostream(iostream):
         self.proc = Popen(self.cmd, shell=True, stdout=PIPE)
         super(stap_ostream, self).__init__(self.proc.stdout)
         logger.log('%s\nloading...'%(self.cmd))
+    def __del__(self):
+        self.proc.stdout.close()
     @property
     def stdout(self):
         return stap.proc.stdout
@@ -130,7 +141,7 @@ class stap_ostream(iostream):
             mod = mod[1:-1] if len(mod) >= 2 else ''
             if os.access(mod, os.X_OK):
                 cmd = 'addr2line -Cf -e %s %s'%(mod, msg[0])
-                addr2line = os.popen(cmd).read().split('\n')[1]
+                addr2line = execute(cmd).split('\n')[1]
                 if addr2line != '??:0':
                     msg[-1] = addr2line
             return ' '.join(msg)
@@ -145,6 +156,7 @@ if __name__=="__main__":
     stdin= std_istream(sys.stdin)
     ios = {sys.stdin  : stdin, 
            stap.stdout: stap}
+
     while 1:
         reads = select.select(ios.keys(),[],[])[0]
         for read in reads:

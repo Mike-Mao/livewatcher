@@ -34,7 +34,6 @@ enum LW_IOCTL_OPS {
     LW_IOCTL_IGNORE_HWBP_SIGTRAP,
     LW_IOCTL_RECORD_WATCHER,
     LW_IOCTL_UBACKTRACE_DETAIL,
-    LW_IOCTL_TKILL_WEIGHT,
     LW_IOCTL_MAX                //MUST be the last one
 };
 
@@ -113,9 +112,7 @@ int lw_record_watcher(int stack_level) {
 int lw_ubacktrace_detail(int detail) {
     return ioctl(DUMMY_FD, LW_IOCTL_UBACKTRACE_DETAIL, detail);
 }
-int lw_tkill_weight(int weight) {
-    return ioctl(DUMMY_FD, LW_IOCTL_TKILL_WEIGHT, weight);
-}
+
 int lw_show_info(const char *fmt, ...) {
     int  len, ret = -1;
     char info[LW_MAX_INFO];

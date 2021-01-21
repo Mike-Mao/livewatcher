@@ -87,17 +87,13 @@ At the beginning of the code,  there are two macro definitions:
 
  `STAP_USE_DO_TKILL`   It could be 0 、1 or 2.  After setting a breakpoint,  `livewatcher.stp`  needs to synchronize it to all other threads. When it is 0,  `livewatcher.stp ` sets the debug register directly.  When it is 1, `livewatcher.stp `  uses `stap_do_tkill` to send `SIGUSR1` to threads and the signal handle synchronizes  the breakpoint.  When it is 2,  `livewatcher.stp`  sends `SIGUSR1` if the thread is running.
 
-```
-(FIXME:it seems that calling do_tkill in systemtap probe point causes the endless loop in kernel. When STAP_DBG_DO_TKILL is 0, the program do not call do_tkill and it cannot synchronizes the breakpoint to a running thread.)
-```
-
 `livewatcher.stp`  creates several  files in procfs after it starts.
 
 ```
 //the path name is random
 /proc/systemtap/stap_566c2a9eec2e0339f15dd6a2dd39a559__3314
 [mike@mao stap_566c2a9eec2e0339f15dd6a2dd39a559__3314]$ ls
-lw_ignore_hwbp_sigtrap  lw_record_watcher  lw_runtime  lw_tkill_weight  lw_ubacktrace_detail
+lw_ignore_hwbp_sigtrap  lw_record_watcher  lw_runtime  lw_ubacktrace_detail
 [mike@mao stap_566c2a9eec2e0339f15dd6a2dd39a559__3314]$ 
 ```
 
@@ -106,7 +102,5 @@ lw_ignore_hwbp_sigtrap  lw_record_watcher  lw_runtime  lw_tkill_weight  lw_uback
 `lw_record_watcher`    whether to record backtraces where the breakpoints are set. 0 means disable. A positive number means the limitation of the callstack level.  A negative number means that there is no limit.
 
 `lw_runtime`    show some runtime information about  `livewatcher.stp`.
-
-`lw_tkill_weight`    `livewatcher.stp` counts the number of threads which could be set debug registers directly.  When  `STAP_USE_DO_TKILL == 2` and  `count % tkill_weight != 0` , it sends `SIGUSR1` to the threads.
 
 `lw_ubacktrace_detail`    whether to show  detailed information about backtraces.
