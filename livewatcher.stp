@@ -3,8 +3,14 @@
 global hwbp2watcher
 
 %{
+#define LW_SYNC_DIRECT              0
+#define LW_SYNC_SIGALL              1
+#define LW_SYNC_LOCKRQ              2
+#define LW_SYNC_SIGRUN              3
+#define LW_SYNC_SINGLESTEP          4
+
 #define STAP_USE_PTRACE_PEEKUSR     1
-#define STAP_USE_DO_TKILL           2
+#define STAP_SYNC_HWBP              LW_SYNC_SIGRUN
 
 #include <linux/sched.h>
 #include <linux/smp.h>
@@ -16,6 +22,8 @@ global hwbp2watcher
 #include <linux/signal.h>
 #include <linux/ptrace.h>
 #include <linux/cpumask.h>
+#include <linux/irqflags.h>
+#include <linux/perf_event.h>
 
 #define DR0                    (offsetof(struct user, u_debugreg[0]))
 #define DR1                    (offsetof(struct user, u_debugreg[1]))
@@ -40,6 +48,8 @@ global hwbp2watcher
 #define eq_dr7 (old, idx, len, rw) ((old & DR7MASK(idx)) == DR7VALUE(idx, len, rw))
 
 /* refer to the user space encoding format */
+#define ENCODE_FD(idx,len,rw)  (int)((0x7ffff000) | (((idx)&0xf)<<8) | \
+                               (((len)&0xf)<<4) | ((rw)&0xf))
 #define DECODE_FD(idx, len, rw, fd)  do {                     \
                                         idx = (fd >> 8) & 0xf;\
                                         len = (fd >> 4) & 0xf;\
@@ -57,6 +67,7 @@ enum LW_IOCTL_OPS {
     LW_IOCTL_IGNORE_HWBP_SIGTRAP,
     LW_IOCTL_RECORD_WATCHER,
     LW_IOCTL_UBACKTRACE_DETAIL,
+    LW_IOCTL_INITHWBP,
     LW_IOCTL_MAX                //MUST be the last one
 };
 struct dr7_t {
@@ -95,25 +106,19 @@ typedef struct  {
     long __user *umem;
 }stap_dr_umem_t;
 
-#if defined(STAP_USE_DO_TKILL) && STAP_USE_DO_TKILL
-#if STAP_USE_DO_TKILL == 2
 /*
  *  'struct rq' is not exported and it is a incomplete type
  *  in this program.But we can get the runqueue pointer of
  *  each CPU and then we need to confirm the offset of lock 
  *  and curr:1)lock is the first member up to 5.7.0   2)the 
- *  position of the curr is based on onditional compilation
+ *  position of the curr is based on conditional compilation
  *  and kernel version.we use &@cast to get the offset value.
  */
-static void *stap_per_cpu__runqueues = NULL;
+#if STAP_SYNC_HWBP == LW_SYNC_LOCKRQ
+static void *stap_runqueues = NULL;
 static int  stap_rq_offsetof_lock    = -1;
 static int  stap_rq_offsetof_curr    = -1;
 #endif
-int(*stap_do_tkill)(pid_t tgid, pid_t pid, int sig) = NULL;
-#endif
-
-long (*stap_arch_ptrace)(struct task_struct *child,long request, 
-                         long addr, long data) = NULL;
 
 static DEFINE_SEQLOCK(stap_hwbp_lock);
 static int            stap_hwbp_pid = -1;
@@ -124,10 +129,15 @@ static long __user   *stap_dr_umem = NULL;
 static stap_dr_umem_t stap_dr_umems[DR_UMEM_NR] = {};
 
 /* these configurations could be accessed without lock */
-int ubacktrace_detail   = 1;
-int ignore_hwbp_sigtrap = 1;
-int record_watcher      = 0;
+static int ubacktrace_detail   = 1;
+static int ignore_hwbp_sigtrap = 1;
+static int record_watcher      = 0;
 
+static long (*stap_arch_ptrace)(struct task_struct *child,long request,long addr,long data) = NULL;
+#if STAP_SYNC_HWBP == LW_SYNC_SIGALL || STAP_SYNC_HWBP == LW_SYNC_LOCKRQ || STAP_SYNC_HWBP == LW_SYNC_SIGRUN
+static int (*stap_do_tkill)(pid_t tgid, pid_t pid, int sig) = NULL;
+static void (*stap_force_sig)(int sig, struct task_struct *p) = NULL;
+#endif
 /**********************************************************/
 static int match_ksymbol(void *data, const char *name, 
                          struct module *module, unsigned long address) {
@@ -151,11 +161,11 @@ static void* search_ksymbol(char *name) {
     return (void*)tmpksym.addr;
 }
 
-#if defined(STAP_USE_DO_TKILL) && STAP_USE_DO_TKILL == 2
+#if STAP_SYNC_HWBP == LW_SYNC_LOCKRQ
 #ifdef CONFIG_SMP
-#define stap_cpu_rq(cpu) (SHIFT_PERCPU_PTR(stap_per_cpu__runqueues, per_cpu_offset(cpu)))
+#define stap_cpu_rq(cpu) (SHIFT_PERCPU_PTR(stap_runqueues, per_cpu_offset(cpu)))
 #else
-#define stap_cpu_rq(cpu) (stap_per_cpu__runqueues)
+#define stap_cpu_rq(cpu) (stap_runqueues)
 #endif
 #define stap_task_rq(p)  stap_cpu_rq(task_cpu(p))
 
@@ -282,6 +292,7 @@ static long __setdr(struct task_struct *tsk, int dr, long value) {
         value &= 0xffffffff;
     return stap_arch_ptrace(tsk, PTRACE_POKEUSR, dr, value);
 }
+
 void __sync_hwbp(struct task_struct *tsk, int dr) {
 #define SYNC_ONE(dr,idx) do {                                  \
                             if(__getdr(tsk,dr)!=stap_hwbp[idx])\
@@ -305,6 +316,20 @@ void __sync_hwbp(struct task_struct *tsk, int dr) {
 	} while (read_seqretry(&stap_hwbp_lock, seq));
 #undef SYNC_ONE
 }
+void smp_singlestep(void *data) {
+    struct task_struct *tsk = data;
+    struct task_struct *tmp = tsk;
+    const int cpu = smp_processor_id();
+    struct pt_regs *regs;
+ 
+     while_each_thread(tsk, tmp) {
+        if (task_cpu(tmp) == cpu && tmp->exit_state == 0) {
+            regs = task_pt_regs(tmp);
+            regs->flags |= X86_EFLAGS_TF;
+            regs->flags &= ~X86_EFLAGS_IF;
+        }
+    }
+}
 %}
 /**********************************************************/
 function STAP_USE_PTRACE_PEEKUSR() %{
@@ -314,12 +339,8 @@ function STAP_USE_PTRACE_PEEKUSR() %{
     STAP_RETURN(0);
 #endif
 %}
-function STAP_USE_DO_TKILL() %{
-#ifdef STAP_USE_DO_TKILL
-    STAP_RETURN(STAP_USE_DO_TKILL);
-#else
-    STAP_RETURN(0);
-#endif
+function STAP_SYNC_HWBP() %{
+    STAP_RETURN(STAP_SYNC_HWBP);
 %}
 /*
  * in stp,long is 64bit,we get a big positive number if a negative number
@@ -332,22 +353,32 @@ function convert_long:long(arg:long) %{
 %}
 */
 function __init_stap_runtime(lock, curr) %{
-    long ret = 0;
-    stap_arch_ptrace = search_ksymbol("arch_ptrace");
-    ret = (long)stap_arch_ptrace;
-#if defined(STAP_USE_DO_TKILL) && STAP_USE_DO_TKILL
-    stap_do_tkill = search_ksymbol("do_tkill");
-    ret = ret && (long)stap_do_tkill;
-#if STAP_USE_DO_TKILL == 2
-    stap_per_cpu__runqueues = search_ksymbol("per_cpu__runqueues");
+#define INIT_FUNCPTR(var, sym, check) do {  \
+                                        var = search_ksymbol(sym); \
+                                        if (check && var == NULL) { \
+                                            printk("livewatcher: fail to init %s!\n", sym); \
+                                            STAP_RETURN(-1);  \
+                                        } \
+                                    } while(0)
+
+    INIT_FUNCPTR(stap_arch_ptrace, "arch_ptrace", 1);
+#if STAP_SYNC_HWBP == LW_SYNC_SIGALL || STAP_SYNC_HWBP == LW_SYNC_LOCKRQ || STAP_SYNC_HWBP == LW_SYNC_SIGRUN
+    INIT_FUNCPTR(stap_do_tkill, "do_tkill", 1);
+    INIT_FUNCPTR(stap_force_sig, "force_sig", 1);
+#endif
+
+#if STAP_SYNC_HWBP == LW_SYNC_LOCKRQ
     stap_rq_offsetof_lock   = STAP_ARG_lock;
     stap_rq_offsetof_curr   = STAP_ARG_curr;
-    ret = ret && (long)stap_per_cpu__runqueues;
-    ret = ret && (stap_rq_offsetof_lock >= 0);
-    ret = ret && (stap_rq_offsetof_curr >= 0);
+    if (stap_rq_offsetof_lock < 0 || stap_rq_offsetof_curr < 0)
+        STAP_RETURN(-1);
+    INIT_FUNCPTR(stap_runqueues, "runqueues", 0);
+    if (stap_runqueues == NULL) {
+        INIT_FUNCPTR(stap_runqueues, "per_cpu__runqueues", 1);
+    }
 #endif
-#endif
-    STAP_RETURN(ret);
+    STAP_RETURN(0);
+#undef INIT_FUNCPTR
 %}
 function init_stap_runtime() {
     lock = &@cast(0, "rq", "kernel")->lock
@@ -381,7 +412,8 @@ function dump_dr(resetdr6) {
     }
 }
 function sync_hwbp(task:long) %{
-#if defined(STAP_USE_DO_TKILL) && STAP_USE_DO_TKILL
+#if STAP_SYNC_HWBP == LW_SYNC_SIGALL || STAP_SYNC_HWBP == LW_SYNC_LOCKRQ || \
+    STAP_SYNC_HWBP == LW_SYNC_SIGRUN || STAP_SYNC_HWBP == LW_SYNC_SINGLESTEP
     struct task_struct *tsk = (struct task_struct *)(long)STAP_ARG_task;
     __sync_hwbp(tsk, -1);
 #endif
@@ -409,14 +441,16 @@ function set_ubacktrace_detail(arg) %{
     ubacktrace_detail = !!STAP_ARG_arg;
 %}
 
-function setwatcher:long(task:long, para:long, addr:long) %{  /* guru */
+function setwatcher:long(task:long, para:long, addr:long, self:long) %{  /* guru */
     static const long hwbpmap[DR_HWBP_NR] = {DR0, DR1, DR2, DR3};
     long newaddr = STAP_ARG_addr == LW_RESET_HWBP ? 0 : STAP_ARG_addr;
     struct task_struct *tsk = (struct task_struct *)(long)STAP_ARG_task;
     struct task_struct *t   = tsk;
     unsigned int idx, len, rw, skip;
     unsigned int mask,new,cpu;
-
+    unsigned long sync_data;
+    long self = STAP_ARG_self;
+    
     DECODE_FD(idx, len, rw, STAP_ARG_para);
     if(len >= 4 || idx >= DR_HWBP_NR || 
        (rw != 0 && rw != 1 && rw != 3)) {
@@ -430,8 +464,7 @@ function setwatcher:long(task:long, para:long, addr:long) %{  /* guru */
     write_seqlock(&stap_hwbp_lock);
     if (stap_hwbp_pid != tsk->tgid) {
         write_sequnlock(&stap_hwbp_lock);
-        printk("livewatcher error:%d is running,%d needs to wait\n", 
-               stap_hwbp_pid, tsk->tgid);
+        printk("livewatcher error:%d is running,%d needs to wait\n", stap_hwbp_pid, tsk->tgid);
         STAP_RETURN(-EBUSY);
     } else if (stap_hwbp[idx] != newaddr ||
         (stap_hwbp[DR_HWBP_NR] & mask) != new) {
@@ -446,19 +479,27 @@ function setwatcher:long(task:long, para:long, addr:long) %{  /* guru */
             stap_hwbp[DR_HWBP_NR] = 0;
     }
     write_sequnlock(&stap_hwbp_lock);
+    if (self) {
+        __sync_hwbp(tsk, hwbpmap[idx]);
+        goto end;
+    }
+
     if (skip) {
         goto end;
     }
 
-#if defined(STAP_USE_DO_TKILL) && STAP_USE_DO_TKILL
-    __sync_hwbp(tsk, hwbpmap[idx]);
     cpu = smp_processor_id();
- 
-    while_each_thread(tsk, t) {
+    do {
+        if (t->exit_state != 0)
+            continue;
         if (task_cpu(t) == cpu) {
             __sync_hwbp(t, hwbpmap[idx]);
         } else {
-#if STAP_USE_DO_TKILL == 2
+#if STAP_SYNC_HWBP == LW_SYNC_DIRECT
+            __sync_hwbp(tsk, hwbpmap[idx]);
+#elif STAP_SYNC_HWBP == LW_SYNC_SIGALL
+            stap_do_tkill(t->tgid, t->pid, SIGUSR1);
+#elif STAP_SYNC_HWBP == LW_SYNC_LOCKRQ
             void *rq = stap_lock_taskrq(t);
             if (rq) {
                 __sync_hwbp(t, hwbpmap[idx]);
@@ -467,18 +508,22 @@ function setwatcher:long(task:long, para:long, addr:long) %{  /* guru */
                 stap_unlock_taskrq(rq);
                 stap_do_tkill(t->tgid, t->pid, SIGUSR1);
             }
+#elif STAP_SYNC_HWBP == LW_SYNC_SIGRUN
+            if (t->state != TASK_RUNNING) 
+                __sync_hwbp(t, hwbpmap[idx]);
+            else
+                stap_do_tkill(t->tgid, t->pid, SIGUSR1);
+#elif STAP_SYNC_HWBP == LW_SYNC_SINGLESTEP
+            /*  sync hwbp in SIGTRAP handler */
 #else
-            stap_do_tkill(t->tgid, t->pid, SIGUSR1);
+#error "invalid STAP_SYNC_HWBP: do not support!"
 #endif
-        }
-    }
-#else
-    do {
-        if (t->exit_state == 0) {
-            __sync_hwbp(tsk, hwbpmap[idx]);
         }
     } while_each_thread(tsk, t);
+#if STAP_SYNC_HWBP == LW_SYNC_SINGLESTEP
+    smp_call_function(smp_singlestep, (void*)tsk, 1);
 #endif
+
 end:
     STAP_RETURN(0);
 %}
@@ -540,8 +585,10 @@ end:
 %}
 function set_dr_umem(exe, pid, umem) {
     if (!STAP_USE_PTRACE_PEEKUSR()) {
-        if (umem) printf("Error:do not support PTRACE_PEEKUSR")
-        return umem ? %{-EPERM%} : 0
+        if (umem) 
+            printf("Warning:do not support PTRACE_PEEKUSR\n")
+        //return umem ? %{-EPERM%} : 0
+        return 0
     }
     return __set_dr_umem(0, pid, umem)
 }
@@ -587,7 +634,7 @@ probe procfs("lw_runtime").read {
     cur = %{(unsigned long)stap_dr_umem%}
     
     s1 = sprintf("STAP_USE_PTRACE_PEEKUSR=%d\n", STAP_USE_PTRACE_PEEKUSR())
-    s2 = sprintf("STAP_USE_DO_TKILL=%d\n\n", STAP_USE_DO_TKILL())
+    s2 = sprintf("STAP_SYNC_HWBP=%d\n\n", STAP_SYNC_HWBP())
     s3 = sprintf("pid=%d\nDR0=%x\nDR1=%x\nDR2=%x\nDR3=%x\nDR7=%x\n\n", 
          %{stap_hwbp_pid%}, %{stap_hwbp[0]%}, %{stap_hwbp[1]%}, 
          %{stap_hwbp[2]%},  %{stap_hwbp[3]%}, %{stap_hwbp[4]%})
@@ -598,7 +645,7 @@ probe procfs("lw_runtime").read {
     $value = sprintf("%s%s%s%s%s%s", s1,s2,s3,s4,s5,s6)
 }
 probe kernel.function("prepare_signal").return {
-	if ($sig == %{SIGTRAP%}) {
+	if (@entry($sig) == %{SIGTRAP%}) {
         hwbp = getdr(task_current(), %{DR6%}) & %{DR6_TRAP_BITS%}
         if (hwbp > 0) {
             show_taskinfo()
@@ -620,31 +667,33 @@ probe kernel.function("prepare_signal").return {
         }
 	}
 }
+
 probe syscall.ioctl {
-    if ($cmd == %{LW_IOCTL_SYNC_HWBP%}) {
-        sync_hwbp(task_current())
-    }
-}
-probe syscall.ioctl.return {
-    if ($return != 0 && 
-        $cmd >= %{LW_IOCTL_MIN%} && 
-        $cmd <= %{LW_IOCTL_MAX%}) {
-        ret = 0
+    if ($cmd >= %{LW_IOCTL_MIN%} && $cmd <= %{LW_IOCTL_MAX%}) {
         if ($cmd == %{LW_IOCTL_SET_HWBP%}) {
-           ret = setwatcher(task_current(), $fd, $arg)
+           ret = setwatcher(task_current(), $fd, $arg, 0)
            if (%{record_watcher%} && ret == 0) {
-               hwbp = 1 << (($fd >> 8) & 0xf)
-               hwbp2watcher[hwbp] = %{record_watcher%} < 0 ?
+                hwbp = 1 << (($fd >> 8) & 0xf)
+                hwbp2watcher[hwbp] = %{record_watcher%} < 0 ?
                    ubacktrace():ucallers(%{record_watcher%})
            }
         } else if ($cmd == %{LW_IOCTL_SYNC_HWBP%}) {
-            ret = 0
+            sync_hwbp(task_current())
         } else if ($cmd == %{LW_IOCTL_ATINIT%}) {
             reset_hwbp(pid())
-            ret = set_dr_umem(execname(), pid(), $arg)
+            set_dr_umem(execname(), pid(), $arg)
+        } else if ($cmd == %{LW_IOCTL_INITHWBP%}) {
+            tmpfd = %{ENCODE_FD(0, 0, 1)%}
+            setwatcher(task_current(), tmpfd, $arg, 1)
+            tmpfd = %{ENCODE_FD(1, 0, 1)%}
+            setwatcher(task_current(), tmpfd, $arg + 1, 1)
+            tmpfd = %{ENCODE_FD(2, 0, 1)%}
+            setwatcher(task_current(), tmpfd, $arg + 2, 1)
+            tmpfd = %{ENCODE_FD(3, 0, 1)%}
+            setwatcher(task_current(), tmpfd, $arg + 3, 1)
         } else if ($cmd == %{LW_IOCTL_ATEXIT%}) {
             reset_hwbp(-1);
-            ret = set_dr_umem(execname(), pid(), 0)
+            set_dr_umem(execname(), pid(), 0)
         } else if ($cmd == %{LW_IOCTL_DUMP_DR%}) {
             show_taskinfo()
             dump_dr(0)
@@ -656,18 +705,15 @@ probe syscall.ioctl.return {
             set_record_watcher($arg)
         } else if ($cmd == %{LW_IOCTL_UBACKTRACE_DETAIL%}) {
             set_ubacktrace_detail($arg)
-        } else {
-            ret = %{-EINVAL%}
         }
-        $return = ret
     }
 }
 probe begin {
-    %( arch != "i386" && arch != "i686" && arch != "x86 64" %?
+    %( arch != "i386" && arch != "i686" && arch != "x86_64" %?
         printf("Error: do not support this architecture\n")
         exit()
     %)
-    if (!init_stap_runtime()) {
+    if (init_stap_runtime()) {
         printf("Error: init_stap_runtime fail\n")
         exit()
     }

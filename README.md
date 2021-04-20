@@ -2,7 +2,7 @@
 
 ## background
 
-In c/c++ programs, memory corruption is a common kind of problem. In general, the difficulty lies in finding when and where the memory is corrupted. the `watch` command of `GDB` is useful when the problem is easy to reproduce. Otherwise we need to find other solutions. `mprotect` is a solution and here is another one.
+In c/c++ programs, memory corruption is a common kind of problem. In general, the difficulty lies in finding when and where the memory is corrupted. the `watch` command of `GDB` is useful when the problem is easy to reproduce. Otherwise we need to find other solutions. There are some solutions like `mprotect`, `address sanitizer`. Here is another one.
 
 ## implemention
 
@@ -17,24 +17,24 @@ Livewatcher consists of three parts:
 ## usage
 
 ```
-WARNING: The project is under development. One known problem is that endless loop may occur in kernel. Try it in test environment.
+WARNING: The project is under development. Dead lock may occur in kernel. Try it in test environment.
 ```
 
 1. Install `systemtap` and `debuginfo` referring to [this wiki](https://sourceware.org/systemtap/wiki). Here is my system information.
 
    ```
-   //VirtualBox 6.1.16
    [root@mao /]# cat /proc/cpuinfo | grep "model name" | uniq
    model name	: Intel(R) Core(TM) i5-2450M CPU @ 2.50GHz
    [root@mao /]# cat /etc/redhat-release
-   CentOS release 6.6 (Final)
+   CentOS Linux release 7.9.2009 (Core)
    [root@mao /]# uname -a
-   Linux mao 2.6.32-504.el6.i686 #1 SMP Wed Oct 15 03:02:07 UTC 2014 i686 i686 i386 GNU/Linux
+   Linux mao 3.10.0-1160.el7.x86_64 #1 SMP Mon Oct 19 16:18:59 UTC 2020 x86_64 x86_64 x86_64 GNU/Linux
    [root@mao /]# stap --version
-   Systemtap translator/driver (version 2.5/0.164, rpm 2.5-5.el6)
-   Copyright (C) 2005-2014 Red Hat, Inc. and others
+   Systemtap translator/driver (version 4.0/0.176, rpm 4.0-13.el7)
+   Copyright (C) 2005-2018 Red Hat, Inc. and others
    This is free software; see the source for copying conditions.
-   enabled features: AVAHI LIBRPM LIBSQLITE3 NSS TR1_UNORDERED_MAP NLS
+   tested kernel versions: 2.6.18 ... 4.19-rc7
+   enabled features: AVAHI BOOST_STRING_REF DYNINST BPF JAVA PYTHON2 LIBRPM LIBSQLITE3 LIBVIRT LIBXML2 NLS NSS READLINE
    ```
 
 2. Build and install `liblivewatcher` 
@@ -63,9 +63,11 @@ WARNING: The project is under development. One known problem is that endless loo
    
 6. Run the program and  `livewatcher.stp` prints backtraces when breakpoints are accessed.
 
-```
-[mike@mao livewatcher]$ ./sample/sample
-```
+   ```
+   [mike@mao livewatcher]$ ./sample/sample
+   ```
+
+   ![](./doc/img/backtrace.png)
 
 ## options
 
@@ -79,13 +81,19 @@ example:
 [root@mao livewatcher]# ./watch.py -p ./sample/sample --addr2line
 ```
 
-### livewatcher.stp
+### livewatcher.stp 
 
 At the beginning of the code,  there are two macro definitions:
 
 `STAP_USE_PTRACE_PEEKUSR`    It could be 0 or 1.  When it is 1,  `livewatcher.stp` uses  `stap_arch_ptrace` and `get_user` to read the value of debug registers. Otherwise,  `livewatcher.stp` uses different code for diffrent kernel version to do this. This may cause compatibility issues. It is recommended to set it to 1.
 
- `STAP_USE_DO_TKILL`   It could be 0 、1 or 2.  After setting a breakpoint,  `livewatcher.stp`  needs to synchronize it to all other threads. When it is 0,  `livewatcher.stp ` sets the debug register directly.  When it is 1, `livewatcher.stp `  uses `stap_do_tkill` to send `SIGUSR1` to threads and the signal handle synchronizes  the breakpoint.  When it is 2,  `livewatcher.stp`  sends `SIGUSR1` if the thread is running.
+ `STAP_SYNC_HWBP`   After setting a breakpoint,  `livewatcher.stp`  needs to synchronize it to all other threads. It sets the debug register directly for the threads which runs on the current CPU. There are several methords to do it with the threads which run on other CPUs.
+
+- `LW_SYNC_DIRECT`  set the debug register directly.
+- `LW_SYNC_SIGALL`  send SIGUSR1 to threads which runs on other CPUs and set debug registers in the signal handler.
+- `LW_SYNC_LOCKRQ`   lock the runqueue and set the debug register directly if the thread is not running, or send `SIGUSR1 `
+- `LW_SYNC_SIGRUN`   set the debug register directly if the thread is not runable, or send `SIGUSR1 `
+- `LW_SYNC_SINGLESTEP`  set `EFLAGS` to raise `SIGTRAP` , set debug registers  and reset `EFLAGS`  in the signal handler
 
 `livewatcher.stp`  creates several  files in procfs after it starts.
 

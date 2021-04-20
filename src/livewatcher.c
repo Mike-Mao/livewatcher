@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -9,16 +10,20 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <execinfo.h>
+#include <ucontext.h>
+#include <asm/processor-flags.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <sys/sysinfo.h>
 #include <sys/mman.h>
 #include "livewatcher.h"
 
+
+#define DR_HWBP_NR            4
 #define LW_MAX_BACKTRACE      32
 #define LW_LOCKF              "/tmp/livewatcher.lck"
-#define LW_RESET_HWBP         0
-#define DR_HWBP_NR            4
+#define LW_RESET_HWBP         (void*)0
+#define LW_FREE_HWBP          (void*)1
 #define ENCODE_FD(dr,len,rw)  (int)((0x7ffff000) | (((dr)&0xf)<<8) | \
                               (((len)&0xf)<<4) | ((rw)&0xf))
 #define DUMMY_FD              ENCODE_FD(0,1,1)
@@ -34,23 +39,35 @@ enum LW_IOCTL_OPS {
     LW_IOCTL_IGNORE_HWBP_SIGTRAP,
     LW_IOCTL_RECORD_WATCHER,
     LW_IOCTL_UBACKTRACE_DETAIL,
+    LW_IOCTL_INITHWBP,
     LW_IOCTL_MAX                //MUST be the last one
 };
 
 static pthread_mutex_t lw_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int lw_status[DR_HWBP_NR] = {0};
 
+static inline int lw_ioctl(int d, int request, long arg) {
+    int ret = ioctl(d, request, arg);
+    if (request >= LW_IOCTL_MIN && request <= LW_IOCTL_MAX && ret < 0 && errno == EBADF)
+        ret = 0;
+    return ret;
+}
+
 static void sigusr1_handler(int signum) {
     (void)signum;
     ioctl(DUMMY_FD, LW_IOCTL_SYNC_HWBP, 0);
 }
-static void sigtrap_handler(int signum) {
+static void sigtrap_handler(int signum, siginfo_t *si, void *context) {
     (void)signum;
-    lw_show_info("-----unexpected SIGTRAP-----\n");
-    ioctl(DUMMY_FD, LW_IOCTL_DUMP_DR, 0);
-    lw_backtrace("unexpected SIGTRAP %d %ld\n", 
-                 getpid(), syscall(__NR_gettid));
+    (void)si;
+    ucontext_t *ctx = context;
+    if (ctx->uc_mcontext.gregs[REG_EFL] & X86_EFLAGS_TF) {
+        ioctl(DUMMY_FD, LW_IOCTL_SYNC_HWBP, 0);
+        ctx->uc_mcontext.gregs[REG_EFL] &= (~X86_EFLAGS_TF);
+        ctx->uc_mcontext.gregs[REG_EFL] |= X86_EFLAGS_IF;
+    }
 }
+
 static void lw_exit() {
     ioctl(DUMMY_FD, LW_IOCTL_ATEXIT, 0);
 }
@@ -62,10 +79,11 @@ static void lw_init() {
     static int inited = 0;
     int fd, errline, page;
     size_t size;
-    void *umem;
-    
+    void *umem = NULL;
+    struct sigaction sa;
     
     if (inited) return;
+
     fd = open(LW_LOCKF, O_RDWR|O_CREAT|O_CLOEXEC, 0666);
     CHECK(fd >= 0);
     CHECK(lockf(fd, F_TLOCK, 0) == 0);
@@ -84,9 +102,12 @@ static void lw_init() {
     }
 #endif
     CHECK(mlock(umem, size) == 0);
-    CHECK(ioctl(DUMMY_FD, LW_IOCTL_ATINIT, umem) == 0);
+    CHECK(lw_ioctl(DUMMY_FD, LW_IOCTL_ATINIT, (long)umem) == 0);
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = sigtrap_handler;
+    CHECK(sigaction(SIGTRAP, &sa, NULL) == 0);
     CHECK(signal(SIGUSR1, sigusr1_handler) != SIG_ERR);
-    CHECK(signal(SIGTRAP, sigtrap_handler) != SIG_ERR);
     /* functions registered using atexit() are not called if a 
      * process terminates abnormally because of the delivery of
      * a signal.it does no matter here.
@@ -101,16 +122,16 @@ fail:
     exit(-1);
 }
 int lw_dump_dr() {
-    return ioctl(DUMMY_FD, LW_IOCTL_DUMP_DR, 0);
+    return lw_ioctl(DUMMY_FD, LW_IOCTL_DUMP_DR, 0);
 }
 int lw_ignore_hwbp_sigtrap(int ignore) {
-    return ioctl(DUMMY_FD, LW_IOCTL_IGNORE_HWBP_SIGTRAP, ignore);
+    return lw_ioctl(DUMMY_FD, LW_IOCTL_IGNORE_HWBP_SIGTRAP, ignore);
 }
 int lw_record_watcher(int stack_level) {
-    return ioctl(DUMMY_FD, LW_IOCTL_RECORD_WATCHER, stack_level);
+    return lw_ioctl(DUMMY_FD, LW_IOCTL_RECORD_WATCHER, stack_level);
 }
 int lw_ubacktrace_detail(int detail) {
-    return ioctl(DUMMY_FD, LW_IOCTL_UBACKTRACE_DETAIL, detail);
+    return lw_ioctl(DUMMY_FD, LW_IOCTL_UBACKTRACE_DETAIL, detail);
 }
 
 int lw_show_info(const char *fmt, ...) {
@@ -122,7 +143,7 @@ int lw_show_info(const char *fmt, ...) {
 	len = vsnprintf(info, LW_MAX_INFO, fmt, args);
 	va_end(args);
     if (len > 0 && len < LW_MAX_INFO) {
-        ret = ioctl(DUMMY_FD, LW_IOCTL_SHOW_INFO, (unsigned long)info);
+        ret = lw_ioctl(DUMMY_FD, LW_IOCTL_SHOW_INFO, (long)info);
     }
     return ret;
 }
@@ -131,7 +152,7 @@ int lw_backtrace(const char *fmt, ...) {
     void *stack[LW_MAX_BACKTRACE];
     
     if (fmt) {
-        char msg[LW_MAX_INFO];
+        char msg[LW_MAX_INFO] = {0};
         va_list args;
         va_start(args, fmt);
         vsnprintf(msg, LW_MAX_INFO, fmt, args);
@@ -144,10 +165,10 @@ int lw_backtrace(const char *fmt, ...) {
         backtrace_symbols_fd(stack, count, STDOUT_FILENO);
     return count;
 }
-int alloc_watcher()
-{   
+int alloc_watcher() {
     int ret = -1;
     int index;
+
     if (pthread_mutex_lock(&lw_mutex) != 0) {
         perror("fail to lock lw_mutex");
         return -1;
@@ -169,38 +190,40 @@ int alloc_watcher()
 }
 int set_watcher(int watcher, void* addr, size_t len, int rw) {   
     static const int len2regflag[] = {0, 0, 1, -1, 3, -1, -1, -1, 2};
-    unsigned long tmpaddr = (unsigned long)addr;
-    int tmp_fd;
+    long tmpaddr = (long)addr;
+    int tmp_fd, ret;
 
     assert(watcher >= 0 && watcher < DR_HWBP_NR);
     assert(len == 1 || len == 2 || len == 4 || len == 8);
     assert(rw == 0 || rw  == 1 || rw == 3);  // 0--exe 1--write 3--write or read
-    assert(lw_status[watcher] == 1);
-    
+
     if (rw == 0) len = 0;
     tmp_fd = ENCODE_FD(watcher, len2regflag[len], rw);
-    return ioctl(tmp_fd, LW_IOCTL_SET_HWBP, tmpaddr);
-}
-int rst_watcher(int watcher) {
-    assert(watcher >= 0 && watcher < DR_HWBP_NR);
-    assert(lw_status[watcher] == 1);
-    return set_watcher(watcher, (void*)LW_RESET_HWBP, 1, 1);
-}
-int free_watcher(int watcher) {
-    int ret = 0;
-    assert(watcher >= 0 && watcher < DR_HWBP_NR);
+
     if (pthread_mutex_lock(&lw_mutex) != 0) {
         perror("fail to lock lw_mutex");
         return -1;
     }
-    if (set_watcher(watcher, (void*)LW_RESET_HWBP, 1, 1) != 0) {   
+    if (lw_status[watcher] != 1) {
         ret = -1;
-        perror("free_watcher: fail to reset watcher");
+        fprintf(stderr,"livewatcher watcher(%d) is free!\n", watcher);
+        goto fin;
     }
-    lw_status[watcher] = 0;
+    if (addr == LW_FREE_HWBP) {
+        tmpaddr = (long)LW_RESET_HWBP;
+        lw_status[watcher] = 0;
+    }
+    ret = lw_ioctl(tmp_fd, LW_IOCTL_SET_HWBP, tmpaddr);
+fin:
     if (pthread_mutex_unlock(&lw_mutex) != 0) {
         ret = -1;
         perror("fail to unlock lw_mutex");
     }
     return ret;
+}
+int rst_watcher(int watcher) {
+    return set_watcher(watcher, LW_RESET_HWBP, 1, 1);
+}
+int free_watcher(int watcher) {
+    return set_watcher(watcher, LW_FREE_HWBP, 1, 1);
 }
